@@ -5,10 +5,15 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const pool = require('./db');
 
+const askRouter = require('./routes/ask');
+
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+// Routes
+app.use('/api/ask', askRouter);
 
 // Health check
 app.get('/health', async (req, res) => {

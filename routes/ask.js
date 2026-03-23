@@ -1,0 +1,183 @@
+const express = require('express');
+const { GoogleGenAI } = require('@google/genai');
+const pool = require('../db');
+
+const router = express.Router();
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const TRANSCRIPTION_MODEL = 'gemini-2.5-flash';
+const GENERATION_MODEL = 'gemini-2.5-flash';
+const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+
+// Accept raw binary body (audio bytes from Unity)
+router.post('/', express.raw({ type: 'application/octet-stream', limit: '10mb' }), async (req, res) => {
+    try {
+        const artifactId = req.headers['x-artifact-id'];
+        if (!artifactId) {
+            return res.status(400).json({ error: 'Missing x-artifact-id header' });
+        }
+
+        // Look up artifact context
+        const artifactResult = await pool.query(
+            'SELECT id, name, context FROM artifacts WHERE name = $1',
+            [artifactId]
+        );
+        if (artifactResult.rows.length === 0) {
+            return res.status(404).json({ error: `Artifact '${artifactId}' not found` });
+        }
+        const artifact = artifactResult.rows[0];
+
+        const audioBase64 = req.body.toString('base64');
+
+        // Step A: Transcribe audio with Gemini
+        const transcription = await transcribeAudio(audioBase64);
+        console.log(`[ask] Transcription: "${transcription}"`);
+
+        // Step B: Check cache for similar question
+        const cached = await checkCache(artifact.id, transcription);
+        if (cached) {
+            console.log(`[ask] Cache hit for artifact ${artifactId}`);
+            res.set('Content-Type', 'audio/wav');
+            return res.send(cached.audio_response);
+        }
+
+        // Step C: Generate grounded response
+        const responseText = await generateGroundedResponse(artifact, transcription);
+        console.log(`[ask] Generated response: "${responseText.substring(0, 100)}..."`);
+
+        // Step C.2: Convert response text to audio via TTS
+        const audioBytes = await textToSpeech(responseText);
+
+        // Step D: Save to cache
+        await saveToCache(artifact.id, transcription, audioBytes);
+        console.log(`[ask] Cached response for artifact ${artifactId}`);
+
+        res.set('Content-Type', 'audio/wav');
+        res.send(audioBytes);
+    } catch (err) {
+        console.error('[ask] Error:', err.message);
+        res.status(500).json({ error: 'Internal server error', details: err.message });
+    }
+});
+
+async function transcribeAudio(audioBase64) {
+    const response = await ai.models.generateContent({
+        model: TRANSCRIPTION_MODEL,
+        contents: [{
+            role: 'user',
+            parts: [
+                { text: 'Transcribe this audio clip verbatim. Return only the transcribed text, nothing else.' },
+                { inlineData: { mimeType: 'audio/wav', data: audioBase64 } }
+            ]
+        }]
+    });
+    return response.text.trim();
+}
+
+async function checkCache(artifactDbId, questionText) {
+    // Use trigram similarity or simple ILIKE for now
+    const result = await pool.query(
+        `SELECT audio_response FROM qa_cache
+         WHERE artifact_id = $1 AND LOWER(question_text) = LOWER($2)
+         LIMIT 1`,
+        [artifactDbId, questionText]
+    );
+    return result.rows.length > 0 ? result.rows[0] : null;
+}
+
+async function generateGroundedResponse(artifact, questionText) {
+    const response = await ai.models.generateContent({
+        model: GENERATION_MODEL,
+        contents: [{
+            role: 'user',
+            parts: [{ text: questionText }]
+        }],
+        systemInstruction: {
+            parts: [{
+                text: `You are an expert museum audio guide. You are currently discussing: "${artifact.name}".
+
+Context about this artifact:
+${artifact.context}
+
+Rules:
+- Respond conversationally as a knowledgeable museum guide speaking to a visitor.
+- Keep responses concise (2-4 sentences) unless the visitor asks for more detail.
+- Use the Google Search grounding tool to verify any historical facts, dates, or claims.
+- If you are unsure about something, say so rather than guessing.
+- Do not use markdown, bullet points, or any text formatting — your response will be spoken aloud.`
+            }]
+        },
+        tools: [{ google_search: {} }]
+    });
+    return response.text.trim();
+}
+
+async function textToSpeech(text) {
+    const response = await ai.models.generateContent({
+        model: TTS_MODEL,
+        contents: [{
+            role: 'user',
+            parts: [{ text: text }]
+        }],
+        config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+                voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: 'Kore' }
+                }
+            }
+        }
+    });
+
+    // Extract audio data from response
+    const audioPart = response.candidates[0].content.parts.find(p => p.inlineData);
+    if (!audioPart) {
+        throw new Error('No audio data in TTS response');
+    }
+
+    const pcmBuffer = Buffer.from(audioPart.inlineData.data, 'base64');
+
+    // Wrap PCM in WAV header (16-bit, mono, 24kHz — Gemini TTS default)
+    return createWavBuffer(pcmBuffer, 24000, 1, 16);
+}
+
+function createWavBuffer(pcmData, sampleRate, channels, bitsPerSample) {
+    const byteRate = sampleRate * channels * (bitsPerSample / 8);
+    const blockAlign = channels * (bitsPerSample / 8);
+    const dataSize = pcmData.length;
+    const headerSize = 44;
+
+    const buffer = Buffer.alloc(headerSize + dataSize);
+
+    // RIFF header
+    buffer.write('RIFF', 0);
+    buffer.writeUInt32LE(36 + dataSize, 4);
+    buffer.write('WAVE', 8);
+
+    // fmt chunk
+    buffer.write('fmt ', 12);
+    buffer.writeUInt32LE(16, 16);           // chunk size
+    buffer.writeUInt16LE(1, 20);            // PCM format
+    buffer.writeUInt16LE(channels, 22);
+    buffer.writeUInt32LE(sampleRate, 24);
+    buffer.writeUInt32LE(byteRate, 28);
+    buffer.writeUInt16LE(blockAlign, 32);
+    buffer.writeUInt16LE(bitsPerSample, 34);
+
+    // data chunk
+    buffer.write('data', 36);
+    buffer.writeUInt32LE(dataSize, 40);
+    pcmData.copy(buffer, 44);
+
+    return buffer;
+}
+
+async function saveToCache(artifactDbId, questionText, audioBuffer) {
+    await pool.query(
+        `INSERT INTO qa_cache (artifact_id, question_text, audio_response)
+         VALUES ($1, $2, $3)`,
+        [artifactDbId, questionText, audioBuffer]
+    );
+}
+
+module.exports = router;
