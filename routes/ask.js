@@ -9,7 +9,42 @@ const TRANSCRIPTION_MODEL = 'gemini-2.5-flash';
 const GENERATION_MODEL = 'gemini-2.5-flash';
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 
-// Accept raw binary body (audio bytes from Unity)
+// Shared handler for both audio and text input
+async function handleAskRequest(artifactId, questionText, res) {
+    // Look up artifact context
+    const artifactResult = await pool.query(
+        'SELECT id, name, context FROM artifacts WHERE name = $1',
+        [artifactId]
+    );
+    if (artifactResult.rows.length === 0) {
+        return res.status(404).json({ error: `Artifact '${artifactId}' not found` });
+    }
+    const artifact = artifactResult.rows[0];
+
+    // Step B: Check cache for similar question
+    const cached = await checkCache(artifact.id, questionText);
+    if (cached) {
+        console.log(`[ask] Cache hit for artifact ${artifactId}`);
+        res.set('Content-Type', 'audio/wav');
+        return res.send(cached.audio_response);
+    }
+
+    // Step C: Generate grounded response
+    const responseText = await generateGroundedResponse(artifact, questionText);
+    console.log(`[ask] Generated response: "${responseText.substring(0, 100)}..."`);
+
+    // Step C.2: Convert response text to audio via TTS
+    const audioBytes = await textToSpeech(responseText);
+
+    // Step D: Save to cache
+    await saveToCache(artifact.id, questionText, audioBytes);
+    console.log(`[ask] Cached response for artifact ${artifactId}`);
+
+    res.set('Content-Type', 'audio/wav');
+    res.send(audioBytes);
+}
+
+// Audio input: transcribe then process
 router.post('/', express.raw({ type: 'application/octet-stream', limit: '10mb' }), async (req, res) => {
     try {
         const artifactId = req.headers['x-artifact-id'];
@@ -17,45 +52,31 @@ router.post('/', express.raw({ type: 'application/octet-stream', limit: '10mb' }
             return res.status(400).json({ error: 'Missing x-artifact-id header' });
         }
 
-        // Look up artifact context
-        const artifactResult = await pool.query(
-            'SELECT id, name, context FROM artifacts WHERE name = $1',
-            [artifactId]
-        );
-        if (artifactResult.rows.length === 0) {
-            return res.status(404).json({ error: `Artifact '${artifactId}' not found` });
-        }
-        const artifact = artifactResult.rows[0];
-
         const audioBase64 = req.body.toString('base64');
 
         // Step A: Transcribe audio with Gemini
         const transcription = await transcribeAudio(audioBase64);
         console.log(`[ask] Transcription: "${transcription}"`);
 
-        // Step B: Check cache for similar question
-        const cached = await checkCache(artifact.id, transcription);
-        if (cached) {
-            console.log(`[ask] Cache hit for artifact ${artifactId}`);
-            res.set('Content-Type', 'audio/wav');
-            return res.send(cached.audio_response);
-        }
-
-        // Step C: Generate grounded response
-        const responseText = await generateGroundedResponse(artifact, transcription);
-        console.log(`[ask] Generated response: "${responseText.substring(0, 100)}..."`);
-
-        // Step C.2: Convert response text to audio via TTS
-        const audioBytes = await textToSpeech(responseText);
-
-        // Step D: Save to cache
-        await saveToCache(artifact.id, transcription, audioBytes);
-        console.log(`[ask] Cached response for artifact ${artifactId}`);
-
-        res.set('Content-Type', 'audio/wav');
-        res.send(audioBytes);
+        await handleAskRequest(artifactId, transcription, res);
     } catch (err) {
         console.error('[ask] Error:', err.message);
+        res.status(500).json({ error: 'Internal server error', details: err.message });
+    }
+});
+
+// Text input: skip transcription
+router.post('/text', express.json(), async (req, res) => {
+    try {
+        const { artifactId, question } = req.body;
+        if (!artifactId || !question) {
+            return res.status(400).json({ error: 'Missing artifactId or question in body' });
+        }
+
+        console.log(`[ask/text] Question: "${question}"`);
+        await handleAskRequest(artifactId, question, res);
+    } catch (err) {
+        console.error('[ask/text] Error:', err.message);
         res.status(500).json({ error: 'Internal server error', details: err.message });
     }
 });
