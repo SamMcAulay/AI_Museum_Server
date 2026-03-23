@@ -1,0 +1,35 @@
+require('dotenv').config();
+
+const express = require('express');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const pool = require('./db');
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+// Health check
+app.get('/health', async (req, res) => {
+    try {
+        await pool.query('SELECT 1');
+        res.json({ status: 'ok', db: 'connected' });
+    } catch (err) {
+        res.status(500).json({ status: 'error', db: 'disconnected', message: err.message });
+    }
+});
+
+const server = http.createServer(app);
+
+// WebSocket server for live audio streaming (future phases)
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+wss.on('connection', (ws) => {
+    console.log('WebSocket client connected');
+    ws.on('close', () => console.log('WebSocket client disconnected'));
+});
+
+server.listen(PORT, () => {
+    console.log(`Museum Tour API running on port ${PORT}`);
+});
