@@ -10,35 +10,36 @@ const GENERATION_MODEL = 'gemini-2.5-flash';
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 
 // Shared handler for both audio and text input
-async function handleAskRequest(artifactId, questionText, res) {
-    // Look up artifact context
+async function handleAskRequest(artifactId, questionText, imageBase64, res) {
+    // Look up artifact context (optional — may not exist for unknown artifacts)
     const artifactResult = await pool.query(
         'SELECT id, name, context FROM artifacts WHERE name = $1',
         [artifactId]
     );
-    if (artifactResult.rows.length === 0) {
-        return res.status(404).json({ error: `Artifact '${artifactId}' not found` });
-    }
-    const artifact = artifactResult.rows[0];
+    const artifact = artifactResult.rows.length > 0 ? artifactResult.rows[0] : null;
 
-    // Step B: Check cache for similar question
-    const cached = await checkCache(artifact.id, questionText);
-    if (cached) {
-        console.log(`[ask] Cache hit for artifact ${artifactId}`);
-        res.set('Content-Type', 'audio/wav');
-        return res.send(cached.audio_response);
+    // Step B: Check cache for similar question (only if artifact exists in DB)
+    if (artifact) {
+        const cached = await checkCache(artifact.id, questionText);
+        if (cached) {
+            console.log(`[ask] Cache hit for artifact ${artifactId}`);
+            res.set('Content-Type', 'audio/wav');
+            return res.send(cached.audio_response);
+        }
     }
 
-    // Step C: Generate grounded response
-    const responseText = await generateGroundedResponse(artifact, questionText);
+    // Step C: Generate grounded response with optional screenshot
+    const responseText = await generateGroundedResponse(artifact, artifactId, questionText, imageBase64);
     console.log(`[ask] Generated response: "${responseText.substring(0, 100)}..."`);
 
     // Step C.2: Convert response text to audio via TTS
     const audioBytes = await textToSpeech(responseText);
 
-    // Step D: Save to cache
-    await saveToCache(artifact.id, questionText, audioBytes);
-    console.log(`[ask] Cached response for artifact ${artifactId}`);
+    // Step D: Save to cache (only if artifact exists in DB)
+    if (artifact) {
+        await saveToCache(artifact.id, questionText, audioBytes);
+        console.log(`[ask] Cached response for artifact ${artifactId}`);
+    }
 
     res.set('Content-Type', 'audio/wav');
     res.send(audioBytes);
@@ -52,13 +53,14 @@ router.post('/', express.raw({ type: 'application/octet-stream', limit: '10mb' }
             return res.status(400).json({ error: 'Missing x-artifact-id header' });
         }
 
+        const imageBase64 = req.headers['x-image-base64'] || null;
         const audioBase64 = req.body.toString('base64');
 
         // Step A: Transcribe audio with Gemini
         const transcription = await transcribeAudio(audioBase64);
         console.log(`[ask] Transcription: "${transcription}"`);
 
-        await handleAskRequest(artifactId, transcription, res);
+        await handleAskRequest(artifactId, transcription, imageBase64, res);
     } catch (err) {
         console.error('[ask] Error:', err.message);
         res.status(500).json({ error: 'Internal server error', details: err.message });
@@ -66,15 +68,15 @@ router.post('/', express.raw({ type: 'application/octet-stream', limit: '10mb' }
 });
 
 // Text input: skip transcription
-router.post('/text', express.json(), async (req, res) => {
+router.post('/text', express.json({ limit: '10mb' }), async (req, res) => {
     try {
-        const { artifactId, question } = req.body;
+        const { artifactId, question, imageBase64 } = req.body;
         if (!artifactId || !question) {
             return res.status(400).json({ error: 'Missing artifactId or question in body' });
         }
 
         console.log(`[ask/text] Question: "${question}"`);
-        await handleAskRequest(artifactId, question, res);
+        await handleAskRequest(artifactId, question, imageBase64 || null, res);
     } catch (err) {
         console.error('[ask/text] Error:', err.message);
         res.status(500).json({ error: 'Internal server error', details: err.message });
@@ -96,7 +98,6 @@ async function transcribeAudio(audioBase64) {
 }
 
 async function checkCache(artifactDbId, questionText) {
-    // Use trigram similarity or simple ILIKE for now
     const result = await pool.query(
         `SELECT audio_response FROM qa_cache
          WHERE artifact_id = $1 AND LOWER(question_text) = LOWER($2)
@@ -106,31 +107,51 @@ async function checkCache(artifactDbId, questionText) {
     return result.rows.length > 0 ? result.rows[0] : null;
 }
 
-async function generateGroundedResponse(artifact, questionText) {
-    const response = await ai.models.generateContent({
-        model: GENERATION_MODEL,
-        contents: [{
-            role: 'user',
-            parts: [{ text: questionText }]
-        }],
-        systemInstruction: {
-            parts: [{
-                text: `You are an expert museum audio guide. You are currently discussing: "${artifact.name}".
+async function generateGroundedResponse(artifact, artifactId, questionText, imageBase64) {
+    // Build the user message parts
+    const userParts = [{ text: questionText }];
 
-Context about this artifact:
-${artifact.context}
+    // Include screenshot if provided so the model can see what the user sees
+    if (imageBase64) {
+        userParts.push({
+            inlineData: { mimeType: 'image/jpeg', data: imageBase64 }
+        });
+    }
+
+    const contextBlock = artifact
+        ? `You are currently discussing: "${artifact.name}".\n\nContext about this artifact:\n${artifact.context}`
+        : `The user is looking at an artifact identified as "${artifactId}". You do not have specific database context for this artifact, so rely on the screenshot and your knowledge.`;
+
+    const systemText = `You are an expert museum audio guide. ${contextBlock}
+
+The user has also sent a screenshot of what they are currently looking at through their phone camera. Use this image to understand what they are referring to, especially for vague questions like "what is this?" or "tell me about this".
 
 Rules:
 - Respond conversationally as a knowledgeable museum guide speaking to a visitor.
 - Keep responses concise (2-4 sentences) unless the visitor asks for more detail.
-- Use the Google Search grounding tool to verify any historical facts, dates, or claims.
 - If you are unsure about something, say so rather than guessing.
-- Do not use markdown, bullet points, or any text formatting — your response will be spoken aloud.`
-            }]
-        },
-        tools: [{ google_search: {} }]
-    });
-    return response.text.trim();
+- Do not use markdown, bullet points, or any text formatting — your response will be spoken aloud.`;
+
+    // Try with grounding first, fall back without if it fails
+    try {
+        const response = await ai.models.generateContent({
+            model: GENERATION_MODEL,
+            contents: [{ role: 'user', parts: userParts }],
+            systemInstruction: { parts: [{ text: systemText }] },
+            config: {
+                tools: [{ googleSearch: {} }]
+            }
+        });
+        return response.text.trim();
+    } catch (err) {
+        console.warn(`[ask] Grounded generation failed (${err.message}), retrying without grounding...`);
+        const response = await ai.models.generateContent({
+            model: GENERATION_MODEL,
+            contents: [{ role: 'user', parts: userParts }],
+            systemInstruction: { parts: [{ text: systemText }] }
+        });
+        return response.text.trim();
+    }
 }
 
 async function textToSpeech(text) {
@@ -177,8 +198,8 @@ function createWavBuffer(pcmData, sampleRate, channels, bitsPerSample) {
 
     // fmt chunk
     buffer.write('fmt ', 12);
-    buffer.writeUInt32LE(16, 16);           // chunk size
-    buffer.writeUInt16LE(1, 20);            // PCM format
+    buffer.writeUInt32LE(16, 16);
+    buffer.writeUInt16LE(1, 20);
     buffer.writeUInt16LE(channels, 22);
     buffer.writeUInt32LE(sampleRate, 24);
     buffer.writeUInt32LE(byteRate, 28);
