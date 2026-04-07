@@ -16,6 +16,29 @@ const PORT = process.env.PORT || 3000;
 // Routes
 app.use('/api/ask', askRouter);
 
+// Diagnostic: list models that support bidiGenerateContent (Live API)
+app.get('/debug/live-models', async (req, res) => {
+    try {
+        const apiKey = process.env.GEMINI_API_KEY;
+        const versions = ['v1beta', 'v1alpha'];
+        const out = {};
+        for (const v of versions) {
+            const r = await fetch(`https://generativelanguage.googleapis.com/${v}/models?key=${apiKey}&pageSize=1000`);
+            const json = await r.json();
+            if (!json.models) {
+                out[v] = { error: json.error || json };
+                continue;
+            }
+            out[v] = json.models
+                .filter(m => (m.supportedGenerationMethods || []).includes('bidiGenerateContent'))
+                .map(m => m.name);
+        }
+        res.json(out);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Health check
 app.get('/health', async (req, res) => {
     try {
