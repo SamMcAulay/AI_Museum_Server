@@ -41,6 +41,7 @@ async function fetchArtifactContext(artifactId) {
  */
 async function handleLiveConnection(ws) {
     let geminiSession = null;
+    let audioChunkCount = 0;
 
     ws.on('message', async (raw) => {
         let msg;
@@ -59,6 +60,10 @@ async function handleLiveConnection(ws) {
             if (!geminiSession) {
                 ws.send(JSON.stringify({ type: 'error', message: 'Session not established. Send setup first.' }));
                 return;
+            }
+            audioChunkCount++;
+            if (audioChunkCount === 1 || audioChunkCount % 20 === 0) {
+                console.log(`[live] Forwarded audio chunk #${audioChunkCount} (${msg.data?.length || 0} b64 chars) to Gemini`);
             }
             // Forward audio chunk to Gemini Live API
             geminiSession.sendRealtimeInput({
@@ -115,7 +120,9 @@ async function handleSetup(ws, artifactId, onSession) {
             config: {
                 responseModalities: [Modality.AUDIO],
                 systemInstruction: fullPrompt,
-                tools: [{ googleSearch: {} }],
+                // googleSearch grounding temporarily disabled to verify base flow.
+                // Re-enable once basic audio round-trip works.
+                // tools: [{ googleSearch: {} }],
                 speechConfig: {
                     voiceConfig: {
                         prebuiltVoiceConfig: { voiceName: 'Kore' }
@@ -129,6 +136,19 @@ async function handleSetup(ws, artifactId, onSession) {
                 },
                 onmessage: (message) => {
                     if (ws.readyState !== ws.OPEN) return;
+
+                    // Verbose: log every message we receive from Gemini so we can see what's happening
+                    const summary = {
+                        hasData: !!message.data,
+                        dataLen: message.data?.length,
+                        setupComplete: !!message.setupComplete,
+                        modelTurn: !!message.serverContent?.modelTurn,
+                        turnComplete: !!message.serverContent?.turnComplete,
+                        interrupted: !!message.serverContent?.interrupted,
+                        toolCall: !!message.toolCall,
+                        text: message.text?.substring(0, 80)
+                    };
+                    console.log('[live] Gemini → server:', JSON.stringify(summary));
 
                     // Forward audio data from Gemini to Unity
                     if (message.data) {
