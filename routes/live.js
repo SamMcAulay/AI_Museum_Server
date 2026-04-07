@@ -72,10 +72,17 @@ async function handleLiveConnection(ws) {
                     mimeType: 'audio/pcm;rate=16000'
                 }
             });
+        } else if (msg.type === 'endAudio') {
+            if (!geminiSession) return;
+            console.log('[live] User finished speaking — signalling audioStreamEnd');
+            try {
+                geminiSession.sendRealtimeInput({ audioStreamEnd: true });
+            } catch (e) {
+                console.error('[live] audioStreamEnd failed, falling back to turnComplete:', e.message);
+                geminiSession.sendClientContent({ turnComplete: true });
+            }
         } else if (msg.type === 'interrupt') {
             if (!geminiSession) return;
-            // Signal end of audio stream — Gemini VAD will handle interruption.
-            // Sending a turnComplete via clientContent interrupts current generation.
             geminiSession.sendClientContent({ turnComplete: true });
         }
     });
