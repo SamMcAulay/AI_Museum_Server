@@ -3,7 +3,7 @@ const pool = require('../db');
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const LIVE_MODEL = 'gemini-live-2.5-flash-preview';
+const LIVE_MODEL = 'gemini-2.0-flash-live-001';
 
 function buildSystemPrompt(artifact) {
     const artifactName = artifact ? artifact.name : 'an unknown artifact';
