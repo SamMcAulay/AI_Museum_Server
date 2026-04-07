@@ -148,15 +148,27 @@ async function handleSetup(ws, artifactId, onSession) {
                     }
                 },
                 onerror: (e) => {
-                    console.error('[live] Gemini session error:', e.error || e.message || e);
+                    console.error('[live] Gemini session error:', JSON.stringify({
+                        message: e?.message,
+                        error: e?.error,
+                        type: e?.type,
+                        raw: String(e)
+                    }));
                     if (ws.readyState === ws.OPEN) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Gemini session error' }));
+                        ws.send(JSON.stringify({ type: 'error', message: `Gemini error: ${e?.message || 'unknown'}` }));
                     }
                 },
-                onclose: () => {
-                    console.log('[live] Gemini session closed');
+                onclose: (e) => {
+                    console.log('[live] Gemini session closed:', JSON.stringify({
+                        code: e?.code,
+                        reason: e?.reason,
+                        wasClean: e?.wasClean
+                    }));
                     if (ws.readyState === ws.OPEN) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Gemini session closed unexpectedly' }));
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            message: `Gemini closed: code=${e?.code || '?'} reason=${e?.reason || 'none'}`
+                        }));
                     }
                 }
             }
