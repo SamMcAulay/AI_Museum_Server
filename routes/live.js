@@ -1,13 +1,9 @@
 const { GoogleGenAI, Modality } = require('@google/genai');
 const pool = require('../db');
 
-// The Live API's half-cascade preview model lives on v1alpha, not v1beta.
-const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: { apiVersion: 'v1alpha' }
-});
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const LIVE_MODEL = 'gemini-live-2.5-flash-preview';
+const LIVE_MODEL = 'gemini-3.1-flash-live-preview';
 
 function buildSystemPrompt(artifact) {
     const artifactName = artifact ? artifact.name : 'an unknown artifact';
