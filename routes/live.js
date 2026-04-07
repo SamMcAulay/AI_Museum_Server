@@ -1,0 +1,172 @@
+const { GoogleGenAI, Modality } = require('@google/genai');
+const pool = require('../db');
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const LIVE_MODEL = 'gemini-live-2.5-flash-preview';
+
+function buildSystemPrompt(artifact) {
+    const artifactName = artifact ? artifact.name : 'an unknown artifact';
+
+    return `You are a museum audio guide standing next to a visitor. The visitor is looking at "${artifactName}".
+
+You have ONE job: answer the visitor's question and NOTHING ELSE.
+
+Imagine the visitor asked you this question face-to-face. You would answer it directly, maybe add one interesting related detail, and then stop talking and wait for their next question. That is exactly what you must do here.
+
+DO NOT dump facts. DO NOT give an overview of the artifact. DO NOT mention details the visitor did not ask about. Every sentence you say must be directly relevant to the specific question asked.
+
+Keep it to 2-3 sentences. Speak naturally.`;
+}
+
+async function fetchArtifactContext(artifactId) {
+    const result = await pool.query(
+        'SELECT id, name, context FROM artifacts WHERE name = $1',
+        [artifactId]
+    );
+    return result.rows.length > 0 ? result.rows[0] : null;
+}
+
+/**
+ * Handles a single WebSocket client connection for live audio streaming.
+ * Protocol (Unity ↔ Server):
+ *   → { type: "setup", artifactId: "..." }
+ *   ← { type: "ready" }
+ *   → { type: "audio", data: "<base64 PCM 16kHz mono 16-bit>" }
+ *   ← { type: "audio", data: "<base64 PCM 24kHz mono 16-bit>" }
+ *   ← { type: "turnComplete" }
+ *   ← { type: "interrupted" }
+ *   → { type: "interrupt" }
+ *   ← { type: "error", message: "..." }
+ */
+async function handleLiveConnection(ws) {
+    let geminiSession = null;
+
+    ws.on('message', async (raw) => {
+        let msg;
+        try {
+            msg = JSON.parse(raw);
+        } catch {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+            return;
+        }
+
+        if (msg.type === 'setup') {
+            await handleSetup(ws, msg.artifactId, (session) => {
+                geminiSession = session;
+            });
+        } else if (msg.type === 'audio') {
+            if (!geminiSession) {
+                ws.send(JSON.stringify({ type: 'error', message: 'Session not established. Send setup first.' }));
+                return;
+            }
+            // Forward audio chunk to Gemini Live API
+            geminiSession.sendRealtimeInput({
+                audio: {
+                    data: msg.data,
+                    mimeType: 'audio/pcm;rate=16000'
+                }
+            });
+        } else if (msg.type === 'interrupt') {
+            if (!geminiSession) return;
+            // Signal end of audio stream — Gemini VAD will handle interruption.
+            // Sending a turnComplete via clientContent interrupts current generation.
+            geminiSession.sendClientContent({ turnComplete: true });
+        }
+    });
+
+    ws.on('close', () => {
+        if (geminiSession) {
+            try { geminiSession.close(); } catch { /* ignore */ }
+            geminiSession = null;
+        }
+        console.log('[live] Client disconnected');
+    });
+
+    ws.on('error', (err) => {
+        console.error('[live] WebSocket error:', err.message);
+        if (geminiSession) {
+            try { geminiSession.close(); } catch { /* ignore */ }
+            geminiSession = null;
+        }
+    });
+}
+
+async function handleSetup(ws, artifactId, onSession) {
+    if (!artifactId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Missing artifactId in setup' }));
+        return;
+    }
+
+    console.log(`[live] Setup requested for artifact: ${artifactId}`);
+
+    const artifact = await fetchArtifactContext(artifactId);
+    const systemPrompt = buildSystemPrompt(artifact);
+
+    // Prepend artifact context if available
+    let fullPrompt = systemPrompt;
+    if (artifact && artifact.context) {
+        fullPrompt += `\n\nHere is background context about this artifact (use it to answer questions accurately, but do NOT recite it unprompted):\n${artifact.context}`;
+    }
+
+    try {
+        const session = await ai.live.connect({
+            model: LIVE_MODEL,
+            config: {
+                responseModalities: [Modality.AUDIO],
+                systemInstruction: fullPrompt,
+                tools: [{ googleSearch: {} }],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: 'Kore' }
+                    }
+                }
+            },
+            callbacks: {
+                onopen: () => {
+                    console.log(`[live] Gemini session opened for artifact: ${artifactId}`);
+                    ws.send(JSON.stringify({ type: 'ready' }));
+                },
+                onmessage: (message) => {
+                    if (ws.readyState !== ws.OPEN) return;
+
+                    // Forward audio data from Gemini to Unity
+                    if (message.data) {
+                        ws.send(JSON.stringify({
+                            type: 'audio',
+                            data: message.data
+                        }));
+                    }
+
+                    if (message.serverContent) {
+                        if (message.serverContent.interrupted) {
+                            ws.send(JSON.stringify({ type: 'interrupted' }));
+                        }
+                        if (message.serverContent.turnComplete) {
+                            ws.send(JSON.stringify({ type: 'turnComplete' }));
+                        }
+                    }
+                },
+                onerror: (e) => {
+                    console.error('[live] Gemini session error:', e.error || e.message || e);
+                    if (ws.readyState === ws.OPEN) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Gemini session error' }));
+                    }
+                },
+                onclose: () => {
+                    console.log('[live] Gemini session closed');
+                    if (ws.readyState === ws.OPEN) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Gemini session closed unexpectedly' }));
+                    }
+                }
+            }
+        });
+
+        onSession(session);
+    } catch (err) {
+        console.error('[live] Failed to connect to Gemini Live API:', err.message);
+        ws.send(JSON.stringify({ type: 'error', message: `Failed to connect: ${err.message}` }));
+    }
+}
+
+module.exports = { handleLiveConnection };

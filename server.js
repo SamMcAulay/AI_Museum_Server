@@ -6,6 +6,7 @@ const { WebSocketServer } = require('ws');
 const pool = require('./db');
 
 const askRouter = require('./routes/ask');
+const { handleLiveConnection } = require('./routes/live');
 
 const app = express();
 app.use(express.json());
@@ -27,12 +28,12 @@ app.get('/health', async (req, res) => {
 
 const server = http.createServer(app);
 
-// WebSocket server for live audio streaming (future phases)
+// WebSocket server for live audio streaming via Gemini Multimodal Live API
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
-    console.log('WebSocket client connected');
-    ws.on('close', () => console.log('WebSocket client disconnected'));
+    console.log('[ws] Client connected');
+    handleLiveConnection(ws);
 });
 
 server.listen(PORT, () => {
