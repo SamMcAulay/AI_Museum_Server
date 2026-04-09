@@ -37,6 +37,7 @@ async function fetchArtifactContext(artifactId) {
  *   ← { type: "turnComplete" }
  *   ← { type: "interrupted" }
  *   → { type: "interrupt" }
+ *   → { type: "text", text: "..." }
  *   ← { type: "error", message: "..." }
  */
 async function handleLiveConnection(ws) {
@@ -84,6 +85,23 @@ async function handleLiveConnection(ws) {
         } else if (msg.type === 'interrupt') {
             if (!geminiSession) return;
             geminiSession.sendClientContent({ turnComplete: true });
+        } else if (msg.type === 'text') {
+            if (!geminiSession) {
+                ws.send(JSON.stringify({ type: 'error', message: 'Session not established. Send setup first.' }));
+                return;
+            }
+            const text = (msg.text || '').trim();
+            if (!text) return;
+            console.log(`[live] Forwarding text question to Gemini: ${text}`);
+            try {
+                geminiSession.sendClientContent({
+                    turns: [{ role: 'user', parts: [{ text }] }],
+                    turnComplete: true
+                });
+            } catch (e) {
+                console.error('[live] sendClientContent(text) failed:', e.message);
+                ws.send(JSON.stringify({ type: 'error', message: `Text send failed: ${e.message}` }));
+            }
         }
     });
 
